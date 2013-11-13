@@ -48,6 +48,18 @@ static struct timeval buffer_save_audio;
 #endif
 
 
+// Java uses an int to hold a raw pointer, which is already ugly.
+// But we need to hold an sp<>, which is of unknown size.
+// So we wrap the sp<> within a class, and give Java the int version of a pointer to this class.
+class AudioRecordWrapper {
+public:
+    AudioRecordWrapper(AudioRecord *audioRecord) : mAudioRecord(audioRecord) { }
+    ~AudioRecordWrapper() { }
+    AudioRecord* get() const { return mAudioRecord.get(); }
+private:
+    const sp<AudioRecord> mAudioRecord;
+};
+
 extern "C" 
 {
 
@@ -56,7 +68,7 @@ extern "C"
 #if defined(USE_DEV_EAC_FILE)
 static int audiofd = -1;
 #else
-static AudioRecord* record;
+static AudioRecordWrapper* arw; //static AudioRecord* record;
 static int sampleRate = 8000;
 static int numChannels = 1;
 #endif
@@ -95,7 +107,7 @@ int AudioOpen(void)
         audio_data = fopen ( file_name, "w" );
     #endif
 // TODO: get record buffer size from hardware.
-    record = new android::AudioRecord(
+  arw = new AudioRecordWrapper(new android::AudioRecord(
                             AUDIO_SOURCE_DEFAULT,
                             sampleRate,
                             AUDIO_FORMAT_PCM_16_BIT,
@@ -104,11 +116,19 @@ int AudioOpen(void)
                             NULL,   /* callback */
                             NULL,   /* callback userdata */
                             0,      /* notificationFrames */
-                            0);     /* sessionId, not supported yet */
+                            0)      /* sessionId, not supported yet */
+        );
 
-  if (!record) return -1;
+  status_t s = arw->get()->initCheck();
 
-  return record->start(android::AudioSystem::SYNC_EVENT_NONE, 0) == NO_ERROR ? 0 : -1;
+  if (s != NO_ERROR) {
+      delete arw;
+      arw = NULL;
+      ALOGE("initCheck error %d ", s);
+      return -1;
+  }
+
+  return arw->get()->start(android::AudioSystem::SYNC_EVENT_NONE, 0) == NO_ERROR ? 0 : -1;
 #endif
 }
 
@@ -117,8 +137,11 @@ int AudioClose(void)
 #if defined(USE_DEV_EAC_FILE)
   return close(audiofd);
 #else
-  record->stop();
-  delete record;
+  if (arw) {
+      arw->get()->stop();
+      delete arw;
+      arw = NULL;
+  }
     #ifdef SAVE_RAW_AUDIO
         fclose ( audio_data );
     #endif
@@ -128,26 +151,28 @@ int AudioClose(void)
 
 int AudioRead(short *buffer, int frame_count)
 {
-  int n;
+  int n = 0;
 #if defined(USE_DEV_EAC_FILE)
   n = read(audiofd, buffer, frame_count*sizeof(short)*N_CHANNELS);
   n /= sizeof(short)*N_CHANNELS;
   return n;
 #else
   int nreq = frame_count * sizeof(short);
-  n = record->read(buffer, nreq);
-  if (n > 0) {
-    if (n != nreq) {
-      PLogError ( "AudioRead error: not enough data %d vs %d\n", n, nreq );
-    }
-    n /= sizeof(short);
+  if (arw) {
+      n = arw->get()->read(buffer, nreq);
+      if (n > 0) {
+         if (n != nreq) {
+            PLogError ( "AudioRead error: not enough data %d vs %d\n", n, nreq );
+         }
+         n /= sizeof(short);
+     }
+     #ifdef SAVE_RAW_AUDIO
+     if ( n > 0 )
+        fwrite ( buffer, 2, n, audio_data );
+     #endif
   }
-    #ifdef SAVE_RAW_AUDIO
-        if ( n > 0 )
-            fwrite ( buffer, 2, n, audio_data );
-    #endif
-  return n;
 #endif
+  return n;
 }
 
 int AudioSetVolume(audio_stream_type_t stream_type, int volume)
